@@ -1,330 +1,267 @@
-# coding=utf-8
-# Copyright 2017-2020 The THUMT Authors
-
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
-import torch
+# -*- coding: utf-8 -*-
+# @Time : 2022/5/4 11:07
+# @Author : Bingshuai Liu
 import torch.nn as nn
-
+import torch
+import thumt.utils as utils
+from thumt.modules.feed_forward import FeedForward
 import thumt.utils as utils
 import thumt.modules as modules
 
 
-class LSTMLayer(modules.Module):
+# class Encoder(nn.Module):
+#     def __init__(self):
+#
+#     def forward(self):
+#         return ""
 
-    def __init__(self, input_size, output_size, normalization=False,
-                 activation=None, name="lstm_layer"):
-        super(LSTMLayer, self).__init__(name)
-        with utils.scope(name):
-            self.lstm_cell = modules.LSTMCell(input_size,
-                                              output_size,
-                                              normalization,
-                                              activation)
+class LSTM(modules.Module):
+    def __init__(self, input_size, output_size, lstm_normalization, lstm_activation):
+        super(LSTM, self).__init__()
+        self.lstmCell = modules.LSTMCell(input_size, output_size)
 
-    def forward(self, x, init_state=None, state=None, batch_first=False):
-        if batch_first is True:
-            # x: [batch, length, hidden_size] -> [length, batch, hidden_size]
-            x = torch.transpose(x, 0, 1)
+    def forward(self, input, init_state=None, state=None):
+        # 将数据的batch和length维度交换
+        # input: [batch, length, hidden_size] -> [length, batch, hidden_size]
+        input = torch.transpose(input, 0, 1)
 
-        steps = x.size(0)
-        batches = x.size(1)
+        t = input.size(0)
+        batch = input.size(1)
 
-        if self.training or state is None:
-            lstm_state = init_state or self.lstm_cell.init_state(batches,
-                                                                 dtype=x.dtype,
-                                                                 device=x.device)
+        # 初始化lstm_state
+        if state is None:
+            lstm_state = self.lstmCell.init_state(batch, dtype=input.dtype, device=input.device)
         else:
             lstm_state = state['lstm_state']
 
-        y = []
-        for i in range(steps):
-            hidden, lstm_state = self.lstm_cell(x[i], lstm_state)
+        hiddens = []
+        for i in range(t):
+            hidden, lstm_state = self.lstmCell(input[i], lstm_state)
 
-            if not self.training and state is not None:
-                state['lstm_state'] = lstm_state
+            # 在第一维前增加一个维度
+            hidden = torch.unsqueeze(hidden, dim=0)
+            hiddens.append(hidden)
+        hiddens = torch.cat(hiddens, dim=0)
 
-            # hidden: [batch, hidden_size] -> [1, batch, hidden_size]
-            y.append(torch.unsqueeze(hidden, dim=0))
-
-        # y: [length, batch, hidden_size]
-        y = torch.cat(y, dim=0)
-        if batch_first is True:
-            # hiddens: [length, batch, hidden_size] -> [batch, length, hidden_size]
-            y = torch.transpose(y, 0, 1)
-
-        return y, lstm_state
+        # 与最开始的操作对应, 将数据还原到原来的格式
+        # hiddens: [length, batch, hidden_size] -> [batch, length, hidden_size]
+        hiddens = torch.transpose(hiddens, 0, 1)
+        return hiddens, lstm_state
 
 
-class DeepLSTMEncoderLayer(modules.Module):
-
-    def __init__(self, params, name="encoder_layer"):
-        super(DeepLSTMEncoderLayer, self).__init__(name)
+class EncoderLayer(modules.Module):
+    def __init__(self, params):
+        super(EncoderLayer, self).__init__()
         self.dropout = params.residual_dropout
+        self.lstm = LSTM(params.hidden_size, params.hidden_size, params.lstm_activation,
+                         params.lstm_normalization)
+        self.ffn = modules.FeedForward(params.hidden_size, params.filter_size,
+                                       dropout=params.relu_dropout)
 
-        with utils.scope(name):
-            self.lstm = LSTMLayer(params.hidden_size,
-                                  params.hidden_size,
-                                  normalization=params.lstm_normalization,
-                                  activation=params.lstm_activation)
-            self.ffn = modules.FeedForward(params.hidden_size,
-                                           params.filter_size,
-                                           dropout=params.relu_dropout)
-
-    def forward(self, x, lstm_state=None, batch_first=True):
-        # lstm
-        y, lstm_state = self.lstm(x=x,
-                                  init_state=lstm_state,
-                                  state=None,
-                                  batch_first=batch_first)
-        # skip connect
-        y = nn.functional.dropout(y, self.dropout, self.training)
-        x = x + y
-
-        # ffn
-        y = self.ffn(x)
-        # skip connect
-        y = nn.functional.dropout(y, self.dropout, self.training)
-        x = x + y
-
-        return x, lstm_state
+    def forward(self, input, init_state=None):
+        hiddens, lstm_state = self.lstm(input, init_state, None)
+        hiddens = self.ffn(hiddens)
+        hiddens = nn.functional.dropout(hiddens, self.dropout, self.training)
+        return hiddens, lstm_state
 
 
-class DeepLSTMEncoder(modules.Module):
+class Encoder(nn.Module):
+    def __init__(self, params):
+        super(Encoder, self).__init__()
+        # self.encoder_layers = params.num_encoder_layers
+        self.encoder_layers = nn.ModuleList([
+            EncoderLayer(params) for i in range(params.num_encoder_layers)
+        ])
 
-    def __init__(self, params, name="encoder"):
-        super(DeepLSTMEncoder, self).__init__(name)
-
-        with utils.scope(name):
-            self.layers = nn.ModuleList([
-                DeepLSTMEncoderLayer(params, name="encoder_layer_%d" % i)
-                for i in range(params.num_encoder_layers)])
-
-    def forward(self, x, batch_first=True):
-        lstm_state = None
-        for i in range(len(self.layers)):
+    def forward(self, input):
+        init_state = None
+        for i in range(len(self.encoder_layers)):
             if i % 2 == 0:
-                x, lstm_state = self.layers[i](x, lstm_state, batch_first)
+                # 奇数层 正向LSTM
+                # input : [batch, length ,hidden_size]
+                input, state = self.encoder_layers[i](input, init_state)
             else:
-                # x: [batch, length, hidden_size]
-                x, lstm_state = self.layers[i](torch.flip(x, dims=[1]), lstm_state, batch_first)
-                x = torch.flip(x, dims=[1])
+                # 偶数层 反向LSTM
+                input, state = self.encoder_layers[i](torch.flip(input, dims=[1]), init_state)
+                input = torch.flip(input, dims=[1])
+        return input
 
-        return x
 
-
-class DeepLSTMDecoderLayer(modules.Module):
-
-    def __init__(self, params, name="decoder_layer"):
-        super(DeepLSTMDecoderLayer, self).__init__()
+class DecoderLayer(modules.Module):
+    def __init__(self, params):
+        super(DecoderLayer, self).__init__()
+        self.mode = params.lstm_mode
         self.dropout = params.residual_dropout
-        self.comb_mode = params.comb_mode
+        # target输入 + encoder_output
+        self.lstm = LSTM(params.hidden_size * 2, params.hidden_size,
+                         params.lstm_normalization, params.lstm_activation)
+        self.ffn = modules.FeedForward(params.hidden_size, params.filter_size,
+                                       params.relu_dropout)
+        self.source_attention = modules.MultiHeadAttention(params.hidden_size,
+                                                           params.lstm_num_heads,
+                                                           dropout=params.attention_dropout)
+        self.target_attention = modules.MultiHeadAttention(params.hidden_size,
+                                                           params.lstm_num_heads,
+                                                           dropout=params.attention_dropout)
 
-        with utils.scope(name):
-            self.ffn = modules.FeedForward(params.hidden_size,
-                                           params.filter_size,
-                                           dropout=params.relu_dropout)
-
-            self.src_attention = modules.MultiHeadAttention(params.hidden_size,
-                                                            params.lstm_num_heads,
-                                                            params.attention_dropout)
-
-            self.tgt_attention = modules.MultiHeadAttention(params.hidden_size,
-                                                            params.lstm_num_heads,
-                                                            params.attention_dropout)
-
-            # x + context
-            self.lstm = LSTMLayer(params.hidden_size + params.hidden_size,
-                                  params.hidden_size,
-                                  normalization=params.lstm_normalization,
-                                  activation=params.lstm_activation)
-
-    def _comb(self, c_src, c_tgt, mode="sum"):
+    def method(self, source, target, mode):
         if mode == "sum":
-            return c_src + c_tgt
+            # 直接做加和
+            return source + target
         elif mode == "gate":
-            # TODO
-            pass
-        elif mode == "hybird":
-            # TODO
-            pass
+            # sigmoid*encoder_output+(1-sigmoid)*decoder_input
+            # c' = g(c,z)*c + (1 - g(c,z))*z
+            return source + target
+        elif mode == "":
+            return source + target
 
-    def forward(self, x, src_bias, tgt_bias, memory=None, lstm_state=None, state=None, batch_first=True):
-        # x, memory, c: [batch, length, hidden_size]
+    def forward(self, input, enc_attn_bias, dec_attn_bias, encoder_output=None, state=None):
+        # [batch, length, hidden_size]
+        # attention部分
+        ##########################
+        source_attention = self.source_attention(input, enc_attn_bias, encoder_output)
 
-        # src-attention
-        c_src = self.src_attention(x, src_bias, memory, kv=None)
-
-        # tgt-attention
         if self.training or state is None:
-            c_tgt = self.tgt_attention(x, tgt_bias, memory=None, kv=None)
+            target_attention = self.target_attention(input, dec_attn_bias)
         else:
             kv = [state["k"], state["v"]]
-            c_tgt, k, v = self.tgt_attention(x, tgt_bias, memory=None, kv=kv)
-            state["k"], state["v"] = k, v
+            target_attention, k, v = self.target_attention(input, dec_attn_bias, memory=None, kv=kv)
+            state["k"] = k
+            state["v"] = v
 
-        c = self._comb(c_src, c_tgt, mode=self.comb_mode)
-
-
-        # ffn
-        y = self.ffn(x)
-        # skip connect
-        y = nn.functional.dropout(y, self.dropout, self.training)
-        x = x + y
-
-        # lstm
-        y, lstm_state = self.lstm(x=torch.cat((x, c), dim=-1),
-                                  init_state=lstm_state,
-                                  state=state,
-                                  batch_first=batch_first)
-        # skip connect
-        y = nn.functional.dropout(y, self.dropout, self.training)
-        x = x + y
-
-        return x, lstm_state
+        stratgy = self.method(source_attention, target_attention, self.mode)
+        # 过FFN层 然后过LSTM层
+        input = self.ffn(input)
+        input = nn.functional.dropout(input, self.dropout, self.training)
+        # LSTM部分
+        ###########################
+        lstm_input = torch.cat((input, stratgy), dim=-1)
+        input, lstm_state = self.lstm(lstm_input, init_state=None, state=state)
+        return input, lstm_state
 
 
-class DeepLSTMDecoder(modules.Module):
+class Decoder(modules.Module):
+    def __init__(self, params):
+        super(Decoder, self).__init__()
+        self.decoder_layers = nn.ModuleList([
+            DecoderLayer(params) for i in range(params.num_decoder_layers)
+        ])
 
-    def __init__(self, params, name="decoder"):
-        super(DeepLSTMDecoder, self).__init__(name)
-
-        with utils.scope(name):
-            self.layers = nn.ModuleList([
-                DeepLSTMDecoderLayer(params, name="decoder_layer_%d" % i)
-                for i in range(params.num_decoder_layers)])
-
-    def forward(self, x, src_bias, tgt_bias, memory=None, state=None, batch_first=True):
-        for i in range(len(self.layers)):
-            if state is not None:
-                x, _ = self.layers[i](x,
-                                   src_bias,
-                                   tgt_bias,
-                                   memory,
-                                   lstm_state=None,
-                                   state=state["decoder"]["layer_%d" % i],
-                                   batch_first=batch_first)
+    def forward(self, input, enc_attn_bias, dec_attn_bias, encoder_output=None, state=None):
+        for i in range(len(self.decoder_layers)):
+            if state is None:
+                input, state = self.decoder_layers[i](
+                    input, enc_attn_bias, dec_attn_bias,
+                    encoder_output, state["decoder"][("layer_" + str(i))]
+                )
             else:
-                x, _ = self.layers[i](x,
-                                   src_bias,
-                                   tgt_bias,
-                                   memory,
-                                   lstm_state=None,
-                                   state=None,
-                                   batch_first=batch_first)
+                input, state = self.decoder_layers[i](
+                    input, enc_attn_bias, dec_attn_bias,
+                    encoder_output, None
+                )
 
-        return x
+        return input
 
 
 class DeepLSTM(modules.Module):
+    def __init__(self, params, name="deeplstm"):
 
-    def __init__(self, params, name="deep_lstm"):
-        super(DeepLSTM, self).__init__(name)
+        super(DeepLSTM, self).__init__()
         self.params = params
-
-        with utils.scope(name):
-            self.build_embedding(params)
-            self.encoder = DeepLSTMEncoder(params)
-            self.decoder = DeepLSTMDecoder(params)
-
-        self.criterion = modules.SmoothedCrossEntropyLoss(params.label_smoothing)
-        self.dropout = params.residual_dropout
+        self.decoder = Decoder(params)
+        self.encoder = Encoder(params)
+        self.build_embedding(params)
         self.hidden_size = params.hidden_size
-        self.num_encoder_layers = params.num_encoder_layers
         self.num_decoder_layers = params.num_decoder_layers
-
+        self.num_encoder_layers = params.num_encoder_layers
+        self.drop = params.residual_dropout
+        self.criterion = modules.SmoothedCrossEntropyLoss(params.label_smoothing)
         self.reset_parameters()
 
     def build_embedding(self, params):
         svoc_size = len(params.vocabulary["source"])
         tvoc_size = len(params.vocabulary["target"])
 
-        self.src_embedding = torch.nn.Parameter(
-            torch.empty([svoc_size, params.hidden_size]))
-        # for what?
-        self.embedding_bias = torch.nn.Parameter(
-            torch.zeros([params.hidden_size]))
-        self.add_name(self.embedding_bias, "embedding_bias")
+        # if params.shared_source_target_embedding and svoc_size != tvoc_size:
+        #     raise ValueError("Cannot share source and target embedding.")
 
-        self.tgt_embedding = torch.nn.Parameter(
-            torch.empty([tvoc_size, params.hidden_size]))
-        self.add_name(self.src_embedding, "src_embedding")
-        self.add_name(self.tgt_embedding, "tgt_embedding")
-
+        # if not params.shared_embedding_and_softmax_weights:
         self.softmax_weights = torch.nn.Parameter(
             torch.empty([tvoc_size, params.hidden_size]))
         self.add_name(self.softmax_weights, "softmax_weights")
 
-    def reset_parameters(self):
-        nn.init.normal_(self.src_embedding, mean=0.0,
-                        std=self.params.hidden_size ** -0.5)
-        nn.init.normal_(self.tgt_embedding, mean=0.0,
-                        std=self.params.hidden_size ** -0.5)
-        nn.init.normal_(self.softmax_weights, mean=0.0,
-                        std=self.params.hidden_size ** -0.5)
+        # if not params.shared_source_target_embedding:
+        self.source_embedding = torch.nn.Parameter(
+            torch.empty([svoc_size, params.hidden_size]))
+        self.target_embedding = torch.nn.Parameter(
+            torch.empty([tvoc_size, params.hidden_size]))
+        self.add_name(self.source_embedding, "source_embedding")
+        self.add_name(self.target_embedding, "target_embedding")
+
+        self.bias = torch.nn.Parameter(torch.zeros([params.hidden_size]))
+        self.add_name(self.bias, "bias")
 
     def encode(self, features, state):
-        src_seq = features["source"]
+        source_sequence = features["source"]
         src_mask = features["source_mask"]
-        src_attn_bias = self.masking_bias(src_mask)
-
-        inputs = torch.nn.functional.embedding(src_seq, self.src_embedding)
+        enc_attn_bias = self.masking_bias(src_mask)
+        # source embedding
+        inputs = torch.nn.functional.embedding(source_sequence, self.source_embedding)
         inputs = inputs * (self.hidden_size ** 0.5)
-        inputs = inputs + self.embedding_bias
+        inputs = inputs + self.bias
 
-        src_attn_bias = src_attn_bias.to(inputs)
-
-        # inputs, outputs: [batch, length, hidden_size]
-        encoder_output = self.encoder(inputs, batch_first=True)
+        # 准备进入encode
+        encoder_output = self.encoder(inputs)
+        enc_attn_bias = enc_attn_bias.to(inputs)
 
         state["encoder_output"] = encoder_output
-        state["src_attn_bias"] = src_attn_bias
+        state["enc_attn_bias"] = enc_attn_bias
 
         return state
 
     def decode(self, features, state, mode="infer"):
         tgt_seq = features["target"]
 
-        src_attn_bias = state["src_attn_bias"]
-        tgt_attn_bias = self.causal_bias(tgt_seq.shape[1])
-
-        targets = torch.nn.functional.embedding(tgt_seq, self.tgt_embedding)
+        enc_attn_bias = state["enc_attn_bias"]
+        dec_attn_bias = self.causal_bias(tgt_seq.shape[1])
+        # target embedding
+        targets = torch.nn.functional.embedding(tgt_seq, self.target_embedding)
         targets = targets * (self.hidden_size ** 0.5)
 
         decoder_input = torch.cat(
             [targets.new_zeros([targets.shape[0], 1, targets.shape[-1]]),
              targets[:, 1:, :]], dim=1)
+        # 这里不需要PE
+        # decoder_input = nn.functional.dropout(self.encoding(decoder_input),
+        #                                       self.dropout, self.training)
 
         encoder_output = state["encoder_output"]
-        tgt_attn_bias = tgt_attn_bias.to(targets)
+        dec_attn_bias = dec_attn_bias.to(targets)
 
         if mode == "infer":
             decoder_input = decoder_input[:, -1:, :]
-            tgt_attn_bias = tgt_attn_bias[:, :, -1:, :]
+            dec_attn_bias = dec_attn_bias[:, :, -1:, :]
 
-        # encoder_output, decoder_input, decoder_output: [batch, length, hidden_size]
-        decoder_output = self.decoder(decoder_input, src_attn_bias, tgt_attn_bias,
-                                      memory=encoder_output, state=state, batch_first=True)
+        # 准备进入decoder
+        decoder_output = self.decoder(decoder_input, dec_attn_bias,
+                                      enc_attn_bias, encoder_output, state)
 
         decoder_output = torch.reshape(decoder_output, [-1, self.hidden_size])
         decoder_output = torch.transpose(decoder_output, -1, -2)
         logits = torch.matmul(self.softmax_weights, decoder_output)
         logits = torch.transpose(logits, 0, 1)
 
-        # logits: [batch * length, tvoc_size]
         return logits, state
 
     def forward(self, features, labels, mode="train", level="sentence"):
+        # [batch_size, length]
         mask = features["target_mask"]
 
         state = self.empty_state(features["target"].shape[0], labels.device)
         state = self.encode(features, state)
         logits, _ = self.decode(features, state, mode=mode)
-
         loss = self.criterion(logits, labels)
         mask = mask.to(torch.float32)
-
         # Prevent FP16 overflow
         if loss.dtype == torch.float16:
             loss = loss.to(torch.float32)
@@ -333,9 +270,19 @@ class DeepLSTM(modules.Module):
             if level == "sentence":
                 return -torch.sum(loss * mask, 1)
             else:
-                return torch.exp(-loss) * mask - (1 - mask)
-
+                return  torch.exp(-loss) * mask - (1 - mask)
         return (torch.sum(loss * mask) / torch.sum(mask)).to(logits)
+
+    @staticmethod
+    def masking_bias(mask, inf=-1e9):
+        ret = (1.0 - mask) * inf
+        return torch.unsqueeze(torch.unsqueeze(ret, 1), 1)
+
+    @staticmethod
+    def causal_bias(length, inf=-1e9):
+        ret = torch.ones([length, length]) * inf
+        ret = torch.triu(ret, diagonal=1)
+        return torch.reshape(ret, [1, 1, length, length])
 
     def empty_state(self, batch_size, device):
         state = {
@@ -350,19 +297,15 @@ class DeepLSTM(modules.Module):
                 } for i in range(self.num_decoder_layers)
             }
         }
-
         return state
 
-    @staticmethod
-    def masking_bias(mask, inf=-1e9):
-        ret = (1.0 - mask) * inf
-        return torch.unsqueeze(torch.unsqueeze(ret, 1), 1)
-
-    @staticmethod
-    def causal_bias(length, inf=-1e9):
-        ret = torch.ones([length, length]) * inf
-        ret = torch.triu(ret, diagonal=1)
-        return torch.reshape(ret, [1, 1, length, length])
+    def reset_parameters(self):
+        nn.init.normal_(self.source_embedding, mean=0.0,
+                        std=self.params.hidden_size ** -0.5)
+        nn.init.normal_(self.target_embedding, mean=0.0,
+                        std=self.params.hidden_size ** -0.5)
+        nn.init.normal_(self.source_embedding, mean=0.0,
+                        std=self.params.hidden_size ** -0.5)
 
     @staticmethod
     def base_params():
@@ -373,16 +316,13 @@ class DeepLSTM(modules.Module):
             unk="<unk>",
             hidden_size=512,
             filter_size=2048,
-            num_heads=1,
+            num_heads=8,
             num_encoder_layers=6,
             num_decoder_layers=4,
             attention_dropout=0.0,
             residual_dropout=0.1,
             relu_dropout=0.0,
             label_smoothing=0.1,
-            lstm_normalization=False,
-            lstm_activation=None,
-            comb_mode="sum",
             # normalization="after",
             # shared_embedding_and_softmax_weights=False,
             # shared_source_target_embedding=False,
@@ -397,14 +337,16 @@ class DeepLSTM(modules.Module):
             adam_beta2=0.98,
             adam_epsilon=1e-9,
             clip_grad_norm=0.0,
-            lstm_num_heads=1
+            lstm_normalization=False,
+            lstm_activation=None,
+            lstm_mode="sum",
+            lstm_num_heads=1,
         )
 
         return params
 
-    @staticmethod
     def default_params(name=None):
         if name == "base":
             return DeepLSTM.base_params()
         else:
-            return DeepLSTM.base_params()
+            return None
