@@ -243,8 +243,8 @@ class DeepLSTM(modules.Module):
             dec_attn_bias = dec_attn_bias[:, :, -1:, :]
 
         # 准备进入decoder
-        decoder_output = self.decoder(decoder_input, dec_attn_bias,
-                                      enc_attn_bias, encoder_output, state)
+        decoder_output = self.decoder(decoder_input, enc_attn_bias,
+                                      dec_attn_bias, encoder_output, state)
 
         decoder_output = torch.reshape(decoder_output, [-1, self.hidden_size])
         decoder_output = torch.transpose(decoder_output, -1, -2)
